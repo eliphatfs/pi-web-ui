@@ -288,6 +288,10 @@ describe("shouldRetainActive（置换决策）", () => {
 		expect(shouldRetainActive({ ...base, openTerminals: 1 })).toBe(true);
 	});
 
+	it("prompt 投递中（未落盘、未 streaming）→ 保留", () => {
+		expect(shouldRetainActive({ ...base, promptInFlight: true })).toBe(true);
+	});
+
 	it("compacting → 保留（切走不再 abort 压缩）", () => {
 		expect(shouldRetainActive({ ...base, compacting: true })).toBe(true);
 	});
