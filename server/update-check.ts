@@ -13,6 +13,7 @@ import { readdirSync, readFileSync, realpathSync, existsSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { pick, type ServerLang } from "./i18n.js";
+import { sdkCopies, type SdkCopy } from "./sdk-origin.js";
 
 const PI_CORE_PACKAGE = "@earendil-works/pi-coding-agent";
 
@@ -64,7 +65,7 @@ export function parsePiVersionOutput(stdout: string): string | null {
 	return stdout.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
 }
 
-export type UpdateItemKind = "webui" | "pi-core" | "package" | "git-extension";
+export type UpdateItemKind = "webui" | "pi-core" | "package" | "git-extension" | "plugin";
 
 export interface UpdateItem {
 	name: string;
@@ -76,6 +77,10 @@ export interface UpdateItem {
 	error?: string;
 	/** git-extension only: `host/path` shorthand (prepend `git:` for the `pi update` command). */
 	source?: string;
+	/** plugin only: directory/install id, matches pluginId. */
+	pluginId?: string;
+	/** plugin only: whether this is a shipped built-in plugin. */
+	builtin?: boolean;
 }
 
 export interface LocalPackage {
@@ -468,6 +473,38 @@ export function defaultProbePiCore(): string | null {
 }
 
 /**
+ * issue #321 — detect "a newer pi is installed on this machine than the one
+ * this process actually loaded". The panel's pi-core row probes the GLOBAL pi
+ * CLI (what `npm i -g` updates), but the server loads its own bundled copy
+ * (nested beats ancestor in Node resolution, issue #260) — so after upgrading
+ * the global pi the panel reads "up to date" while conversations still run the
+ * old SDK. That invisible split is exactly what #321 reports; this turns it
+ * into data the UI can explain.
+ *
+ * Two detectors, unioned (newest wins): the CLI probe (standard global
+ * install) and the ancestor-chain copies (fallback when the probe finds
+ * nothing — different npm prefix, bun, …). Pure — tests inject both.
+ * Returns null when nothing newer than `runningVersion` is found.
+ */
+export function detectPiSdkSplit(
+	runningVersion: string,
+	probePiCore: () => string | null = defaultProbePiCore,
+	copies: SdkCopy[] = sdkCopies(),
+): { running: string; installed: string } | null {
+	let installed = probePiCore();
+	for (const copy of copies) {
+		if (
+			compareVersions(copy.version, runningVersion) > 0 &&
+			(!installed || compareVersions(copy.version, installed) > 0)
+		) {
+			installed = copy.version;
+		}
+	}
+	if (!installed || compareVersions(installed, runningVersion) <= 0) return null;
+	return { running: runningVersion, installed };
+}
+
+/**
  * Fallback when the CLI probe yields nothing: the version of the vendored pi
  * core copy in <agentDir>/npm/node_modules, or null if that is absent too.
  */
@@ -714,7 +751,7 @@ export async function checkAll(
  *  up-to-date ones, errors last. Stable within each bucket (Array.sort is
  *  stable) so registry order survives ties. */
 export function sortUpdateItems(items: UpdateItem[]): UpdateItem[] {
-	const kindRank = (k: UpdateItemKind): number => (k === "webui" ? 0 : k === "pi-core" ? 1 : 2);
+	const kindRank = (k: UpdateItemKind): number => (k === "webui" ? 0 : k === "pi-core" ? 1 : k === "plugin" ? 2 : 3);
 	return [...items].sort((a, b) => {
 		const ka = kindRank(a.kind);
 		const kb = kindRank(b.kind);

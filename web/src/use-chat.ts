@@ -31,11 +31,13 @@ import type {
 	UiPendingQuestion,
 	UiPluginCatalogEntry,
 	UiPluginInfo,
+	UiPluginUpdateInfo,
 	UiProviderConfig,
 	UiQuestion,
 	UiServiceInfo,
 	UiSettingsState,
 	UiState,
+	UiToolApproval,
 } from "./types";
 
 import { applyMessageDelta, type MessageDeltaMsg } from "./message-delta";
@@ -78,14 +80,16 @@ export const UI_LOCALE_EVENT = "pi-web-ui:locale";
 /** One component in an all-source update check (update_status_all). */
 export interface UpdateAllItem {
 	name: string;
-	kind: "webui" | "pi-core" | "package" | "git-extension";
+	kind: "webui" | "pi-core" | "package" | "git-extension" | "plugin";
 	current: string;
 	latest: string | null;
 	latestPublishedAt?: string | null;
 	upToDate: boolean;
 	error?: string;
-	/** git-extension only: `host/path` shorthand (prepend `git:` for the `pi update` command). */
+	/** git-extension / plugin only: `host/path` shorthand (prepend `git:` for the `pi update` command). */
 	source?: string;
+	pluginId?: string;
+	builtin?: boolean;
 }
 
 export interface Notice {
@@ -133,6 +137,20 @@ export interface CatalogSyncState {
 	installed?: { id: string; ok: boolean; error?: string }[];
 	/** 本地收到回执的时间。 */
 	receivedAt: number;
+}
+
+/** 「安装前先读 spec」结果（DSH P0-3）：形状分类 + 已装判定 + 远端 manifest 探测。
+ *  由 `plugin_install_inspect_result` 驱动；problem 非空时设置面板在输入框下显示一句话。 */
+export interface PluginInstallInspectState {
+	requestId: string;
+	source: string;
+	kind: "npm" | "github" | "url" | "path" | "invalid";
+	suggestedId: string;
+	installed: boolean;
+	problem?:
+		"invalid-spec" | "already-installed" | "not-found" | "not-a-package" | "not-a-bundle" | "network" | "unknown";
+	detail?: string;
+	manifest?: { id?: string; name?: string; version?: string; description?: string; permissions?: string[] };
 }
 
 export interface ChatState {
@@ -214,6 +232,10 @@ export interface ChatState {
 	} | null;
 	/** All-source update check (webui + pi core + installed packages). */
 	updatesAll: UpdateAllItem[] | null;
+	/** issue #321：pi SDK 副本状态（update_status_all 随发）。`running` = 本进程实际
+	 *  加载的版本；`bundledInUse` = 加载的是随包自带那份（未跟随全局）；
+	 *  `newerInstalled` = 机器上更新的 pi 版本（全局 CLI / 被遮蔽副本），null = 没有。 */
+	updatesSdk: { running: string; bundledInUse: boolean; newerInstalled: string | null } | null;
 	/** Extension widgets (TUI overlays bridged to the web UI). */
 	widgets: { key: string; lines: string[] }[];
 	/** Extension footer statuses (setStatus bridge). */
@@ -225,6 +247,8 @@ export interface ChatState {
 		title: string;
 		args: unknown[];
 	} | null;
+	/** 待用户审批的高危工具调用（Human-in-the-Loop: Edit & Run）。 */
+	approval: UiToolApproval | null;
 	/** 待用户回答的模型提问（ask_user_question）——两个引擎共用。服务端是事实源：
 	 *  即时通道（question_pending）+ 快照（UiState.pendingQuestion，见 syncPendingQuestion）。 */
 	question: UiPendingQuestion | null;
@@ -263,6 +287,13 @@ export interface ChatState {
 		reqId: number;
 		ok: boolean;
 		models?: UiModelConfigEntry[];
+		error?: string;
+	} | null;
+	/** Last test_model_connection result, matched by reqId in the model config modal. */
+	testModelConnectionResult: {
+		reqId: number;
+		ok: boolean;
+		latencyMs?: number;
 		error?: string;
 	} | null;
 	/** Last enrich_models result (catalog params for draft rows), matched by
@@ -334,6 +365,10 @@ export interface ChatState {
 	plugins: UiPluginInfo[];
 	/** Server-side plugin reload counter (import-cache buster, see plugins msg). */
 	pluginsEpoch: number;
+	/** 已装插件的更新状态（key = pluginId）。 */
+	pluginUpdates: Record<string, UiPluginUpdateInfo> | null;
+	/** 正在检查插件更新 */
+	checkingPluginUpdates: boolean;
 	/** Installable-plugin list (marketplace): shipped catalog + user-added
 	 *  entries, each a one-click install candidate (see plugin_catalog msg). */
 	pluginCatalog: UiPluginCatalogEntry[];
@@ -343,6 +378,8 @@ export interface ChatState {
 	pluginJobs: Record<string, PluginJobState>;
 	/** 最近一次目录同步的回执（设置面板「从目录同步」框展示用；刷新即丢）。 */
 	catalogSync: CatalogSyncState | null;
+	/** 最近一次「安装前先读 spec」的检查结果（设置面板输入框下展示；刷新即丢）。 */
+	installInspect: PluginInstallInspectState | null;
 	/** 插件目录授权表（issue #146）：设置面板列出 + 可撤销。 */
 	pluginGrants: { pluginId: string; paths: string[] }[];
 	/** 插件能力授权表（动态授权）：设置面板列出 + 可撤销；session 授权只在本次运行有效。 */
@@ -423,6 +460,10 @@ type Action =
 			result: { reqId: number; ok: boolean; models?: UiModelConfigEntry[]; error?: string };
 	  }
 	| {
+			type: "test_model_connection_result";
+			result: { reqId: number; ok: boolean; latencyMs?: number; error?: string };
+	  }
+	| {
 			type: "enrich_models_result";
 			result: { reqId: number; ok: boolean; results?: UiEnrichResult[]; error?: string };
 	  }
@@ -486,7 +527,12 @@ type Action =
 				error?: string;
 			};
 	  }
-	| { type: "update_status_all"; items: UpdateAllItem[] }
+	| {
+			type: "update_status_all";
+			items: UpdateAllItem[];
+			/** issue #321：pi SDK 副本状态快照。 */
+			piSdk?: { running: string; bundledInUse: boolean; newerInstalled: string | null };
+	  }
 	| { type: "updates_check_started" }
 	| { type: "widgets"; widgets: { key: string; lines: string[] }[] }
 	| { type: "statuses"; statuses: { key: string; text: string | undefined }[] }
@@ -502,6 +548,10 @@ type Action =
 	| {
 			type: "question";
 			question: UiPendingQuestion | null;
+	  }
+	| {
+			type: "tool_approval";
+			approval: UiToolApproval | null;
 	  }
 	| {
 			type: "remote_question";
@@ -526,10 +576,13 @@ type Action =
 	| { type: "bg_servers"; servers: BgServer[] }
 	| { type: "scheduler_tasks"; tasks: SchedulerTaskView[] }
 	| { type: "plugins"; plugins: UiPluginInfo[]; epoch: number }
+	| { type: "plugin_updates"; updates: UiPluginUpdateInfo[] }
+	| { type: "plugin_updates_check_started" }
 	| { type: "plugin_catalog"; entries: UiPluginCatalogEntry[]; epoch: number }
 	/** 插件后台作业进度（安装/更新/卸载）：line 为该次新增的一行输出。 */
 	| { type: "plugin_job"; job: Omit<PluginJobState, "lines" | "startedAt">; line?: string }
 	| { type: "plugin_catalog_sync_result"; result: Omit<CatalogSyncState, "receivedAt"> }
+	| { type: "plugin_install_inspect_result"; result: PluginInstallInspectState }
 	/** 插件目录授权表（服务端推）。 */
 	| { type: "plugin_grants"; grants: { pluginId: string; paths: string[] }[] }
 	/** 插件能力授权表（服务端推；session 授权只在本次运行有效）。 */
@@ -743,6 +796,7 @@ function reducer(state: ChatState, action: Action): ChatState {
 				...state,
 				ready: true,
 				state: action.state,
+				approval: action.state.pendingApproval ?? null,
 				activeConversationId: action.state.conversationId,
 				liveOutputs: pruneLiveOutputs(state.liveOutputs, action.state),
 				toolStatuses: pruneToolStatuses(state.toolStatuses, action.state),
@@ -766,11 +820,14 @@ function reducer(state: ChatState, action: Action): ChatState {
 				...state,
 				ready: true,
 				state: merged,
+				approval: merged.pendingApproval !== undefined ? (merged.pendingApproval ?? null) : state.approval,
 				activeConversationId: merged.conversationId,
 				liveOutputs: pruneLiveOutputs(state.liveOutputs, merged),
 				toolStatuses: pruneToolStatuses(state.toolStatuses, merged),
 			};
 		}
+		case "tool_approval":
+			return { ...state, approval: action.approval };
 		case "tool_delta": {
 			const prev = state.liveOutputs.get(action.toolCallId);
 			// Keep the TAIL when over the cap (not the head): for a long-running
@@ -846,6 +903,8 @@ function reducer(state: ChatState, action: Action): ChatState {
 		}
 		case "fetch_models_result":
 			return { ...state, fetchModelsResult: action.result };
+		case "test_model_connection_result":
+			return { ...state, testModelConnectionResult: action.result };
 		case "enrich_models_progress":
 			return { ...state, enrichModelsProgress: action.progress };
 		case "enrich_models_result":
@@ -873,7 +932,7 @@ function reducer(state: ChatState, action: Action): ChatState {
 		case "update_status":
 			return { ...state, update: action.status };
 		case "update_status_all":
-			return { ...state, updatesAll: action.items };
+			return { ...state, updatesAll: action.items, updatesSdk: action.piSdk ?? null };
 		case "updates_check_started":
 			// Forced re-check: clear stale rows so the "checking" state renders.
 			return { ...state, updatesAll: null };
@@ -905,6 +964,15 @@ function reducer(state: ChatState, action: Action): ChatState {
 			return { ...state, schedulerTasks: action.tasks };
 		case "plugins":
 			return { ...state, plugins: action.plugins, pluginsEpoch: action.epoch };
+		case "plugin_updates_check_started":
+			return { ...state, checkingPluginUpdates: true };
+		case "plugin_updates": {
+			const map: Record<string, UiPluginUpdateInfo> = {};
+			for (const u of action.updates) {
+				map[u.id] = u;
+			}
+			return { ...state, pluginUpdates: map, checkingPluginUpdates: false };
+		}
 		case "plugin_catalog":
 			return { ...state, pluginCatalog: action.entries, pluginCatalogEpoch: action.epoch };
 		case "plugin_grants":
@@ -927,6 +995,17 @@ function reducer(state: ChatState, action: Action): ChatState {
 			return { ...state, permRequests: state.permRequests.filter((r) => r.id !== action.id) };
 		case "plugin_job": {
 			// 插件后台作业的进度（安装/更新/卸载）——即时通道，不进快照。
+			const { pluginId, phase, ok, action: jobAction } = action.job;
+			let nextUpdates = state.pluginUpdates;
+			if (jobAction === "update" && phase === "done" && ok && state.pluginUpdates?.[pluginId]) {
+				nextUpdates = {
+					...state.pluginUpdates,
+					[pluginId]: {
+						...state.pluginUpdates[pluginId],
+						updatable: false,
+					},
+				};
+			}
 			const prev = state.pluginJobs[action.job.jobId];
 			const lines = action.line ? [...(prev?.lines ?? []), action.line].slice(-40) : (prev?.lines ?? []);
 			const next: PluginJobState = {
@@ -935,10 +1014,17 @@ function reducer(state: ChatState, action: Action): ChatState {
 				lines,
 				startedAt: prev?.startedAt ?? Date.now(),
 			};
-			return { ...state, pluginJobs: { ...state.pluginJobs, [action.job.jobId]: next } };
+			return {
+				...state,
+				pluginUpdates: nextUpdates,
+				pluginJobs: { ...state.pluginJobs, [action.job.jobId]: next },
+			};
 		}
 		case "plugin_catalog_sync_result":
 			return { ...state, catalogSync: { ...action.result, receivedAt: Date.now() } };
+		case "plugin_install_inspect_result":
+			// 只留最近一次（输入框下面的那一句话），旧的直接丢掉。
+			return { ...state, installInspect: action.result };
 		case "dsh_patches":
 			return { ...state, dshPatches: { patchDir: action.patchDir, files: action.files } };
 		case "dsh_presets":
@@ -1050,6 +1136,24 @@ function writeLastCwd(cwd: string): void {
 	}
 }
 
+/** 当用户移出最近项目时，若与上次记忆目录匹配，则同步清除该记忆，避免重启后自动切回并复活墓碑。 */
+export function clearLastCwdIfMatches(path: string): void {
+	try {
+		const current = localStorage.getItem(LAST_CWD_KEY);
+		if (!current) return;
+		const norm = (s: string) =>
+			s
+				.trim()
+				.replace(/[\\/]+$/, "")
+				.toLowerCase();
+		if (current === path || norm(current) === norm(path)) {
+			localStorage.removeItem(LAST_CWD_KEY);
+		}
+	} catch {
+		/* ignore */
+	}
+}
+
 /** Resolve the WebSocket URL: same host when served by the backend, or the Vite proxy in dev. */
 function wsUrl(): string {
 	const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -1087,9 +1191,11 @@ export function useChat() {
 		pathCompletions: [],
 		update: null,
 		updatesAll: null,
+		updatesSdk: null,
 		widgets: [],
 		statuses: [],
 		dialog: null,
+		approval: null,
 		question: null,
 		remoteQuestion: null,
 		commands: [],
@@ -1102,6 +1208,7 @@ export function useChat() {
 		schedulerTasks: [],
 		settings: null,
 		fetchModelsResult: null,
+		testModelConnectionResult: null,
 		enrichModelsResult: null,
 		enrichModelsProgress: null,
 		refreshProviderResult: null,
@@ -1114,10 +1221,13 @@ export function useChat() {
 		scmDirty: 0,
 		plugins: [],
 		pluginsEpoch: 0,
+		pluginUpdates: null,
+		checkingPluginUpdates: false,
 		pluginCatalog: [],
 		pluginCatalogEpoch: 0,
 		pluginJobs: {},
 		catalogSync: null,
+		installInspect: null,
 		pluginGrants: [],
 		pluginPermissions: [],
 		pathRequests: [],
@@ -1200,6 +1310,9 @@ export function useChat() {
 			// state renders instead of the cached list.
 			if (msg.type === "check_updates_all" && msg.force === true) {
 				dispatch({ type: "updates_check_started" });
+			}
+			if (msg.type === "check_plugin_updates") {
+				dispatch({ type: "plugin_updates_check_started" });
 			}
 			ws.send(JSON.stringify(msg));
 			// 提交/取消模型提问后立即收起对话框：服务端只 resolve 模型侧 Promise，
@@ -1386,6 +1499,10 @@ export function useChat() {
 					dispatch({ type: "message_delta", msg });
 					break;
 				}
+				case "subagent_handoff": {
+					// 收到子代理对等交接事件：快照与 notice 会同步下发，此处作为协同事件分发入口
+					break;
+				}
 				case "notice": {
 					const id = ++noticeId.current;
 					dispatch({
@@ -1447,6 +1564,17 @@ export function useChat() {
 							reqId: msg.reqId,
 							ok: msg.ok,
 							models: msg.models,
+							error: msg.error,
+						},
+					});
+					break;
+				case "test_model_connection_result":
+					dispatch({
+						type: "test_model_connection_result",
+						result: {
+							reqId: msg.reqId,
+							ok: msg.ok,
+							latencyMs: msg.latencyMs,
 							error: msg.error,
 						},
 					});
@@ -1563,7 +1691,7 @@ export function useChat() {
 					dispatch({ type: "update_status", status: msg });
 					break;
 				case "update_status_all":
-					dispatch({ type: "update_status_all", items: msg.items });
+					dispatch({ type: "update_status_all", items: msg.items, piSdk: msg.piSdk });
 					break;
 				case "widgets":
 					dispatch({ type: "widgets", widgets: msg.widgets });
@@ -1597,6 +1725,25 @@ export function useChat() {
 							...(msg.conversationTitle !== undefined ? { conversationTitle: msg.conversationTitle } : {}),
 						},
 					});
+					break;
+				case "tool_approval_pending":
+					dispatch({
+						type: "tool_approval",
+						approval: {
+							id: msg.id,
+							toolCallId: msg.toolCallId,
+							toolName: msg.toolName,
+							params: msg.params,
+							reason: msg.reason,
+							reasonEn: msg.reasonEn,
+							...(msg.category ? { category: msg.category } : {}),
+							...(msg.conversationId !== undefined ? { conversationId: msg.conversationId } : {}),
+							...(msg.conversationTitle !== undefined ? { conversationTitle: msg.conversationTitle } : {}),
+						},
+					});
+					break;
+				case "tool_approval_resolved":
+					dispatch({ type: "tool_approval", approval: null });
 					break;
 				case "question_retracted": {
 					// 问卷被搬走/取消（手动过户到另一会话）：源页面正在展示该 id 即立即收起。
@@ -1720,6 +1867,9 @@ export function useChat() {
 				case "plugins":
 					dispatch({ type: "plugins", plugins: msg.plugins, epoch: msg.epoch });
 					break;
+				case "plugin_updates":
+					dispatch({ type: "plugin_updates", updates: msg.updates });
+					break;
 				case "plugin_catalog":
 					dispatch({ type: "plugin_catalog", entries: msg.entries, epoch: msg.epoch });
 					break;
@@ -1756,6 +1906,21 @@ export function useChat() {
 						},
 					});
 					break;
+				case "plugin_dom_consent_request":
+					// DOM 授权两步握手（协议 v20）：grant 由服务端生成在途请求并广播；
+					// 只有发起端（from === 自己的 clientId）自动确认——用户在设置面板
+					// 点一下的体验不变，其他端不是发起人不代答（服务端也只接受广播时
+					// 在线端的应答，陌生连接无从插手）。
+					if (msg.from === getClientId()) {
+						ws.send(
+							JSON.stringify({
+								type: "plugin_dom_consent_response",
+								id: msg.id,
+								ok: true,
+							} satisfies ClientMessage),
+						);
+					}
+					break;
 				case "plugin_job":
 					dispatch({
 						type: "plugin_job",
@@ -1769,6 +1934,21 @@ export function useChat() {
 							...(msg.output ? { output: msg.output } : {}),
 						},
 						...(msg.line ? { line: msg.line } : {}),
+					});
+					break;
+				case "plugin_install_inspect_result":
+					dispatch({
+						type: "plugin_install_inspect_result",
+						result: {
+							requestId: String(msg.requestId ?? ""),
+							source: String(msg.source ?? ""),
+							kind: msg.kind,
+							suggestedId: String(msg.suggestedId ?? ""),
+							installed: msg.installed === true,
+							...(msg.problem ? { problem: msg.problem } : {}),
+							...(msg.detail ? { detail: msg.detail } : {}),
+							...(msg.manifest ? { manifest: msg.manifest } : {}),
+						},
 					});
 					break;
 				case "plugin_catalog_sync_result":

@@ -30,7 +30,12 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { BgServerTracker } from "../bg-servers.js";
-import { ClientStateStore, DEFAULT_RETRY_MAX_ATTEMPTS, normalizeToolWatchdogTimeoutMs } from "../client-state.js";
+import {
+	ClientStateStore,
+	DEFAULT_RETRY_MAX_ATTEMPTS,
+	normalizePathKey,
+	normalizeToolWatchdogTimeoutMs,
+} from "../client-state.js";
 import { normalizeUiLayout } from "../client-state.js";
 import { FilesService, workspacePath, desktopDirWire } from "../files-service.js";
 import { QuiesceRejectedError } from "../agent-service.js";
@@ -201,10 +206,13 @@ interface DshSettings {
 	terminalToolsEnabled: boolean;
 	terminalBash: boolean;
 	terminalBashIdleMs: number;
+	terminalBashMaxForegroundMs: number;
 	toolWatchdogTimeoutMs: number;
 	editSoftEnabled: boolean;
 	/** 问卷提问（ask_user_question）开关（默认开）。关 → 模型不再弹问卷。 */
 	questionnaireEnabled: boolean;
+	/** 工具执行审批总开关（默认开；DSH 无内置高危检测/审批桥，只做持久化位与面板回显）。 */
+	toolApprovalEnabled: boolean;
 	/** 同项目并行提醒开关（默认开）。关 → 同项目并行时不发 notice、不注 AI、不通知对端。 */
 	parallelReminderEnabled: boolean;
 	/** 目标模式（目标条 + 调研向导 + 审查循环）总开关（默认开）。 */
@@ -261,9 +269,11 @@ const DEFAULT_SETTINGS: DshSettings = {
 	terminalToolsEnabled: false,
 	terminalBash: false,
 	terminalBashIdleMs: 15_000,
+	terminalBashMaxForegroundMs: 60_000,
 	toolWatchdogTimeoutMs: 20 * 60_000,
 	editSoftEnabled: false,
 	questionnaireEnabled: true,
+	toolApprovalEnabled: true,
 	goalModeEnabled: true,
 	parallelReminderEnabled: true,
 	thinkingWrap: false,
@@ -438,9 +448,11 @@ export class DshClientSession {
 				terminalToolsEnabled: savedSettings.terminalToolsEnabled,
 				terminalBash: savedSettings.terminalBash,
 				terminalBashIdleMs: savedSettings.terminalBashIdleMs,
+				terminalBashMaxForegroundMs: savedSettings.terminalBashMaxForegroundMs ?? 60_000,
 				toolWatchdogTimeoutMs: savedSettings.toolWatchdogTimeoutMs ?? 20 * 60_000,
 				editSoftEnabled: savedSettings.editSoftEnabled,
 				questionnaireEnabled: savedSettings.questionnaireEnabled ?? true,
+				toolApprovalEnabled: savedSettings.toolApprovalEnabled ?? true,
 				goalModeEnabled: savedSettings.goalModeEnabled ?? true,
 				parallelReminderEnabled: savedSettings.parallelReminderEnabled ?? true,
 				thinkingWrap: savedSettings.thinkingWrap,
@@ -530,6 +542,7 @@ export class DshClientSession {
 			// 直播帧能力跟着运行时进程走：重启后重新探测（换运行时版本也能回落到持久 assistant/chunk）。
 			conv.liveChunks = false;
 		}
+		this.emitConversations();
 		const now = Date.now();
 		if (now - this.runtimeRestart.windowStart > DshClientSession.RUNTIME_RESTART_WINDOW_MS) {
 			this.runtimeRestart.windowStart = now;
@@ -1330,6 +1343,7 @@ export class DshClientSession {
 			conv.streaming = null;
 			this.refreshConversationTitle(conv);
 			this.scheduleSessionsRefresh();
+			this.emitConversations();
 		}
 		this.flushSnapshot();
 	}
@@ -1618,7 +1632,10 @@ export class DshClientSession {
 		const active = this.conv;
 		if (active.messages.length === 0 && active.terminals.list().length === 0) {
 			if (preset) await this.selectAgentPreset(preset);
-			else this.flushSnapshot();
+			else {
+				this.pushSettings();
+				this.flushSnapshot();
+			}
 			return true;
 		}
 		for (const conv of this.convs.values()) {
@@ -1649,6 +1666,7 @@ export class DshClientSession {
 		this.emitConversations();
 		this.emitGoalStatus();
 		this.pushTerminals();
+		this.pushSettings();
 		this.flushSnapshot();
 		void this.refreshActivePermission().catch(() => {});
 		return true;
@@ -1683,6 +1701,7 @@ export class DshClientSession {
 		this.emitConversations();
 		this.emitGoalStatus();
 		this.pushTerminals();
+		this.pushSettings();
 		this.flushSnapshot(true);
 		// 切会话带上权限值（cwd 变化走运行时重启，onStarted 会重拉）。
 		void this.refreshActivePermission().catch(() => {});
@@ -2028,82 +2047,51 @@ export class DshClientSession {
 					});
 				}
 			} else if (resolved) {
-				if (a.mode === "inline" || a.mode === undefined) {
-					// 内联文本（小文件直接读内容）。
+				// 一律只给路径引用：不再把文件内容注入 prompt（小文件也一样），模型用
+				// 自己的读取工具按需读。行范围模式带上行号提示。
+				// 工作区图片文件仍走 attachment store → 真 image 块（模型可看图）。
+				const refText =
+					pick(lang, `\n[文件引用: ${resolved.rel}]`, `\n[File reference: ${resolved.rel}]`, "dsh.attach.file.ref", {
+						"resolved.rel": resolved.rel,
+					}) +
+					(a.mode === "lines" && a.lines
+						? pick(lang, `（第 ${a.lines.start}-${a.lines.end} 行）`, ` (lines ${a.lines.start}-${a.lines.end})`)
+						: "");
+				let isImage = false;
+				try {
+					const st = statSync(resolved.abs);
+					isImage = st.isFile() && st.size > 0 && st.size <= 512 * 1024 && previewKind(resolved.abs) === "image";
+				} catch {
+					/* 不存在/不可读 → 照样给路径引用，读取工具会自己报错 */
+				}
+				if (isImage) {
 					try {
-						const st = statSync(resolved.abs);
-						if (st.size <= 512 * 1024) {
-							const buf = readFileSync(resolved.abs);
-							const kind = previewKind(resolved.abs);
-							if (kind === "image") {
-								// 工作区图片文件 → attachment store → 真 image 块。
-								try {
-									const ext = (resolved.rel.match(/\.([a-z0-9]+)$/iu)?.[1] ?? "png").toLowerCase();
-									const mediaType =
-										ext === "jpg" || ext === "jpeg"
-											? "image/jpeg"
-											: ext === "webp"
-												? "image/webp"
-												: ext === "gif"
-													? "image/gif"
-													: "image/png";
-									const saved = await this.runtime.attachmentSave(mediaType, buf.toString("base64"), resolved.rel);
-									blocks.push({ type: "image", attachment: saved.ref });
-								} catch {
-									blocks.push({
-										type: "text",
-										text: pick(
-											lang,
-											`\n[图片附件: ${resolved.rel}]`,
-											`\n[Image attachment: ${resolved.rel}]`,
-											"dsh.attach.image.ref",
-											{ "resolved.rel": resolved.rel },
-										),
-									});
-								}
-							} else {
-								const enc = this.decodeText(buf);
-								const capped = enc.length > 100_000 ? `${enc.slice(0, 100_000)}\n… [truncated]` : enc;
-								blocks.push({
-									type: "text",
-									text: `\n<file path="${resolved.rel}">\n${capped}\n</file>`,
-								});
-							}
-						} else {
-							blocks.push({
-								type: "text",
-								text: pick(
-									lang,
-									`\n[文件引用: ${resolved.rel}（大文件，请用读取工具查看）]`,
-									`\n[File reference: ${resolved.rel} (large file, use the read tool to view it)]`,
-									"dsh.attach.file.large",
-									{ "resolved.rel": resolved.rel },
-								),
-							});
-						}
+						const buf = readFileSync(resolved.abs);
+						const ext = (resolved.rel.match(/\.([a-z0-9]+)$/iu)?.[1] ?? "png").toLowerCase();
+						const mediaType =
+							ext === "jpg" || ext === "jpeg"
+								? "image/jpeg"
+								: ext === "webp"
+									? "image/webp"
+									: ext === "gif"
+										? "image/gif"
+										: "image/png";
+						const saved = await this.runtime.attachmentSave(mediaType, buf.toString("base64"), resolved.rel);
+						blocks.push({ type: "image", attachment: saved.ref });
 					} catch {
 						blocks.push({
 							type: "text",
 							text: pick(
 								lang,
-								`\n[文件引用: ${resolved.rel}]`,
-								`\n[File reference: ${resolved.rel}]`,
-								"dsh.attach.file.ref.fallback",
+								`\n[图片附件: ${resolved.rel}]`,
+								`\n[Image attachment: ${resolved.rel}]`,
+								"dsh.attach.image.ref",
 								{ "resolved.rel": resolved.rel },
 							),
 						});
 					}
 				} else {
-					blocks.push({
-						type: "text",
-						text: pick(
-							lang,
-							`\n[文件引用: ${resolved.rel}]`,
-							`\n[File reference: ${resolved.rel}]`,
-							"dsh.attach.file.ref",
-							{ "resolved.rel": resolved.rel },
-						),
-					});
+					blocks.push({ type: "text", text: refText });
 				}
 			} else if (a.name) {
 				blocks.push({
@@ -2115,24 +2103,13 @@ export class DshClientSession {
 		return blocks;
 	}
 
-	private decodeText(buf: Buffer): string {
-		try {
-			return new TextDecoder("utf-8", { fatal: true }).decode(buf);
-		} catch {
-			try {
-				return new TextDecoder("gbk").decode(buf);
-			} catch {
-				return buf.toString("latin1");
-			}
-		}
-	}
-
 	/** 中止：kill 运行时进程树（所有 conversation 的运行停止）→ 自动重启保持可用。 */
 	async abort(): Promise<void> {
 		if (!this.runtime.alive) return;
 		const conv = this.conv;
 		conv.isStreaming = false;
 		conv.streaming = null;
+		this.emitConversations();
 		// 手动停止 → 清当前会话的 DSH 原生目标（半成品运行不该继续被轮次驱动）。
 		// 旧进程还活着，先 goal/clear 落盘，再重启运行时。
 		if (conv.dsGoal || conv.goal.goal) {
@@ -2482,6 +2459,7 @@ export class DshClientSession {
 			this.activeId = conv.id;
 			this.emitConversations();
 			this.pushTerminals();
+			this.pushSettings();
 			this.flushSnapshot(true);
 		} catch (err) {
 			this.emit({
@@ -2561,9 +2539,10 @@ export class DshClientSession {
 
 	async pushProjects(): Promise<void> {
 		const saved = this.stateStore.get(this.clientId);
+		const removedKeys = new Set(this.stateStore.getRemovedProjects(this.clientId).map(normalizePathKey));
 		const projects = new Map<string, number>();
 		for (const p of saved.projects ?? []) {
-			if (!(saved.removedProjects ?? []).includes(p.path)) {
+			if (!removedKeys.has(normalizePathKey(p.path))) {
 				projects.set(p.path, p.lastUsed);
 			}
 		}
@@ -2575,14 +2554,16 @@ export class DshClientSession {
 			for (const e of entries) {
 				if (e.isDirectory()) {
 					const cwd = this.decodeProjectKey(e.name);
-					if (cwd && !projects.has(cwd)) cwdProjects.add(cwd);
+					if (cwd && !projects.has(cwd) && !removedKeys.has(normalizePathKey(cwd))) cwdProjects.add(cwd);
 				}
 			}
 		} catch {
 			/* best effort */
 		}
 		for (const cwd of cwdProjects) projects.set(cwd, Date.now());
-		projects.set(this.cwd, Date.now());
+		if (!removedKeys.has(normalizePathKey(this.cwd))) {
+			projects.set(this.cwd, Date.now());
+		}
 		const list: ProjectSummary[] = [...projects.entries()]
 			.map(([path, lastUsed]) => ({ path, lastUsed }))
 			.sort((a, b) => b.lastUsed - a.lastUsed)
@@ -2898,6 +2879,7 @@ export class DshClientSession {
 			terminalToolsEnabled: this.settings.terminalToolsEnabled,
 			terminalBash: this.settings.terminalBash,
 			terminalBashIdleMs: this.settings.terminalBashIdleMs,
+			terminalBashMaxForegroundMs: this.settings.terminalBashMaxForegroundMs,
 			toolWatchdogTimeoutMs: this.settings.toolWatchdogTimeoutMs,
 			// DSH 引擎无 customTool 注册面（工具来自 shipped preset），read 目录覆盖面不存在。
 			readDirEnabled: true,
@@ -2908,6 +2890,10 @@ export class DshClientSession {
 			softCapTokens: 0,
 			softCapByModel: {},
 			questionnaireEnabled: this.settings.questionnaireEnabled,
+			toolApprovalEnabled: this.settings.toolApprovalEnabled !== false,
+			// DSH 无审批弹窗，策略恒为空（保协议完整）。
+			approvalPolicy: { allowAll: false, categories: [] },
+			approvalRules: [],
 			goalModeEnabled: this.settings.goalModeEnabled,
 			parallelReminderEnabled: this.settings.parallelReminderEnabled,
 			thinkingWrap: this.settings.thinkingWrap,
@@ -2964,9 +2950,11 @@ export class DshClientSession {
 		terminalToolsEnabled?: boolean;
 		terminalBash?: boolean;
 		terminalBashIdleMs?: number;
+		terminalBashMaxForegroundMs?: number;
 		toolWatchdogTimeoutMs?: number;
 		editSoftEnabled?: boolean;
 		questionnaireEnabled?: boolean;
+		toolApprovalEnabled?: boolean;
 		goalModeEnabled?: boolean;
 		parallelReminderEnabled?: boolean;
 		thinkingWrap?: boolean;
@@ -2992,10 +2980,13 @@ export class DshClientSession {
 		if (partial.terminalToolsEnabled !== undefined) this.settings.terminalToolsEnabled = partial.terminalToolsEnabled;
 		if (partial.terminalBash !== undefined) this.settings.terminalBash = partial.terminalBash;
 		if (partial.terminalBashIdleMs !== undefined) this.settings.terminalBashIdleMs = partial.terminalBashIdleMs;
+		if (partial.terminalBashMaxForegroundMs !== undefined)
+			this.settings.terminalBashMaxForegroundMs = partial.terminalBashMaxForegroundMs;
 		if (partial.toolWatchdogTimeoutMs !== undefined)
 			this.settings.toolWatchdogTimeoutMs = normalizeToolWatchdogTimeoutMs(partial.toolWatchdogTimeoutMs);
 		if (partial.editSoftEnabled !== undefined) this.settings.editSoftEnabled = partial.editSoftEnabled;
 		if (partial.questionnaireEnabled !== undefined) this.settings.questionnaireEnabled = partial.questionnaireEnabled;
+		if (partial.toolApprovalEnabled !== undefined) this.settings.toolApprovalEnabled = partial.toolApprovalEnabled;
 		if (partial.goalModeEnabled !== undefined) this.settings.goalModeEnabled = partial.goalModeEnabled;
 		if (partial.parallelReminderEnabled !== undefined)
 			this.settings.parallelReminderEnabled = partial.parallelReminderEnabled;
@@ -3022,6 +3013,7 @@ export class DshClientSession {
 			terminalToolsEnabled: this.settings.terminalToolsEnabled,
 			terminalBash: this.settings.terminalBash,
 			terminalBashIdleMs: this.settings.terminalBashIdleMs,
+			terminalBashMaxForegroundMs: this.settings.terminalBashMaxForegroundMs,
 			editSoftEnabled: this.settings.editSoftEnabled,
 			// DSH 无独立重试配置（pi 引擎才暴露），保持默认。
 			retryMaxAttempts: DEFAULT_RETRY_MAX_ATTEMPTS,
@@ -3029,6 +3021,7 @@ export class DshClientSession {
 			softCapTokens: 0,
 			softCapByModel: {},
 			questionnaireEnabled: this.settings.questionnaireEnabled,
+			toolApprovalEnabled: this.settings.toolApprovalEnabled !== false,
 			goalModeEnabled: this.settings.goalModeEnabled,
 			parallelReminderEnabled: this.settings.parallelReminderEnabled,
 			thinkingWrap: this.settings.thinkingWrap,
@@ -3190,6 +3183,7 @@ export class DshClientSession {
 			}
 			conv.agentPreset = res.preset ?? target;
 			this.emitConversations();
+			this.pushSettings();
 			this.flushSnapshot();
 		} catch (err) {
 			this.emit({
@@ -3347,6 +3341,7 @@ export class DshClientSession {
 			terminalToolsEnabled: this.settings.terminalToolsEnabled,
 			terminalBash: this.settings.terminalBash,
 			terminalBashIdleMs: this.settings.terminalBashIdleMs,
+			terminalBashMaxForegroundMs: this.settings.terminalBashMaxForegroundMs,
 			editSoftEnabled: this.settings.editSoftEnabled,
 			// DSH 无独立重试配置，预设沿用默认值。
 			// DSH 无 skill 全文注入概念，给空保预设类型完整。
@@ -3391,6 +3386,8 @@ export class DshClientSession {
 		this.settings.terminalToolsEnabled = preset.terminalToolsEnabled;
 		this.settings.terminalBash = preset.terminalBash;
 		this.settings.terminalBashIdleMs = preset.terminalBashIdleMs;
+		this.settings.terminalBashMaxForegroundMs =
+			preset.terminalBashMaxForegroundMs ?? this.settings.terminalBashMaxForegroundMs;
 		this.settings.editSoftEnabled = preset.editSoftEnabled ?? this.settings.editSoftEnabled;
 		this.settings.reviewPrompt = preset.reviewPrompt ?? "";
 		this.stateStore.saveSettings(this.clientId, {
@@ -3401,6 +3398,7 @@ export class DshClientSession {
 			terminalToolsEnabled: this.settings.terminalToolsEnabled,
 			terminalBash: this.settings.terminalBash,
 			terminalBashIdleMs: this.settings.terminalBashIdleMs,
+			terminalBashMaxForegroundMs: this.settings.terminalBashMaxForegroundMs,
 			editSoftEnabled: this.settings.editSoftEnabled,
 			thinkingWrap: this.settings.thinkingWrap,
 			toolsWrap: this.settings.toolsWrap,
@@ -3548,6 +3546,8 @@ export class DshClientSession {
 			reviewModel?: string;
 			maxRounds?: number;
 			locked?: boolean;
+			/** 目标模式 2.0 的委托执行仅 pi 引擎支持，DSH 忽略这个字段。 */
+			execModel?: string;
 		},
 	): Promise<void> {
 		if (goal.trim() === "") {
@@ -3783,7 +3783,7 @@ export class DshClientSession {
 			`# User's raw requirement`,
 			draft,
 			``,
-			`Use the ask_user_question tool to ask the user focused questions to pin down the essential, ambiguous details. Ask ONE question at a time, usually 2 to 4 questions total: what exactly to build/do, scope boundaries (what NOT to do), acceptance criteria / done-definition, and any constraints (style, performance, environment). Prefer multiple-choice questions (options) when you can offer clear choices.`,
+			`Use the ask_user_question tool to ask the user focused questions to pin down the essential, ambiguous details. Ask ONE question at a time, strictly 1 to 3 questions total: what exactly to build/do, scope boundaries (what NOT to do), acceptance criteria / done-definition, and any constraints (style, performance, environment). Prefer 2 to 4 mutually exclusive options with the recommended choice placed FIRST, and explain the tradeoff in description.`,
 			`Once you have enough to write an unambiguous, reviewable goal, STOP asking and reply with EXACTLY this format and nothing else (no preamble, no bullets):`,
 			`GOAL: <one concrete, verifiable sentence describing the deliverable and its acceptance criteria>`,
 			`Do NOT call create_goal or update_goal — just output the GOAL: line. If the user cancels or stops answering, still produce a sensible best-effort GOAL from what you already know.`,
@@ -3801,7 +3801,13 @@ export class DshClientSession {
 		return "";
 	}
 
-	async setGoalPrefs(opts?: { reviewModel?: string; maxRounds?: number; locked?: boolean }): Promise<void> {
+	async setGoalPrefs(opts?: {
+		reviewModel?: string;
+		maxRounds?: number;
+		locked?: boolean;
+		/** 目标模式 2.0 的委托执行仅 pi 引擎支持，DSH 忽略（GoalBar 对 DSH 隐藏该控件）。 */
+		execModel?: string;
+	}): Promise<void> {
 		const g = this.conv.goal;
 		if (opts?.reviewModel !== undefined) g.reviewModel = opts.reviewModel;
 		if (opts?.maxRounds !== undefined) g.maxRounds = opts.maxRounds;
@@ -4484,6 +4490,7 @@ export class DshClientSession {
 			// 文件树跟随新项目（服务端原生 watcher 自动重挂）。
 			void this.listFiles(undefined);
 			this.pushTerminals();
+			this.pushSettings();
 			this.flushSnapshot(true);
 		} catch (err) {
 			this.emit({

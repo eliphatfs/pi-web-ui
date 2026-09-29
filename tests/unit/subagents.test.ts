@@ -15,6 +15,7 @@ function makeHostSpies() {
 		listSubagents: vi.fn(() => []),
 		steerSubagent: vi.fn(async () => {}),
 		stopSubagent: vi.fn(async () => {}),
+		handoffSubagent: vi.fn(async () => {}),
 		listTemplates: vi.fn(() => [{ name: "reviewer", description: "只读审查" }]),
 		isTemplateUsable: vi.fn((name: string) => name === "reviewer"),
 	};
@@ -22,7 +23,7 @@ function makeHostSpies() {
 }
 
 describe("subagents tools", () => {
-	it("注册 7 个 subagent_* 工具", () => {
+	it("注册 8 个 subagent_* 工具", () => {
 		const host = makeHostSpies();
 		const tools = makeSubagentTools(host);
 		expect(tools.map((t) => t.name)).toEqual([
@@ -33,6 +34,7 @@ describe("subagents tools", () => {
 			"subagent_stop",
 			"subagent_wait_all",
 			"subagent_templates",
+			"subagent_handoff",
 		]);
 		// 全部有 description + 参数 schema。
 		for (const tool of tools) {
@@ -793,12 +795,12 @@ describe("subagents language (issue #91)", () => {
 		expect((r2.content?.[0] as { text: string }).text).toContain("No subagent templates");
 	});
 
-	it("工具 definition 中英内联（英文在前）", () => {
+	it("工具 definition 为纯英文（无双语内联）", () => {
 		const host = makeHostSpies();
 		const [spawn] = makeSubagentTools(host);
 		expect(spawn.description).toContain("subagent");
-		// 中文半句仍在（zh 会话行为不变）
-		expect(spawn.description).toContain("子代理");
+		// 纯英文精简约定：definition 不再携带中文半句
+		expect(spawn.description).not.toMatch(/[\u4e00-\u9fff]/);
 	});
 });
 

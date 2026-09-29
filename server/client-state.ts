@@ -200,6 +200,8 @@ export interface ClientSettings {
 	terminalBash: boolean;
 	/** 接管模式下 bash 的静默解阻阈值（毫秒，默认 15000；0 = 一直等到结束）。 */
 	terminalBashIdleMs: number;
+	/** 接管模式下 bash 前台最长等待毫秒（默认 60000 即 60 秒；0 = 不限）。 */
+	terminalBashMaxForegroundMs: number;
 	/** 工具执行看门狗超时（毫秒，默认 20 分钟；0 = 禁用看门狗）。
 	 *  单个工具调用的最长执行时长，超时自动 abort 会话以防挂死。
 	 *  若工具调用显式指定了更长超时（如 bash timeout），看门狗将自动顺延。
@@ -218,6 +220,9 @@ export interface ClientSettings {
 	editSoftEnabled: boolean;
 	/** 问卷提问开关（默认开；关 → 不弹对话框且 ask_user_question 工具同步禁用。不进预设）。 */
 	questionnaireEnabled: boolean;
+	/** 工具执行审批（人机协同）总开关（默认开）。关 → 一切审批都不弹：内置高危检测
+	 *  直接放行、插件 pre guard 的 ask 也按放行处理。纯运行开关，不进预设、不需 reload。 */
+	toolApprovalEnabled: boolean;
 	/** 同项目并行提醒开关（默认开）。关 → 同一项目另有对话在跑时不再发 notice，
 	 *  也不给 AI 注提醒、不通知对端。纯运行开关，不进预设、不需 reload。 */
 	parallelReminderEnabled: boolean;
@@ -303,6 +308,7 @@ export interface SettingsPreset extends Omit<
 	| "parallelReminderEnabled"
 	// 纯运行行为开关（不进预设：应用预设时保持当前值）。
 	| "readDirEnabled"
+	| "toolApprovalEnabled"
 	| "toolWatchdogTimeoutMs"
 	| "thinkingWrap"
 	| "toolsWrap"
@@ -425,6 +431,8 @@ export interface ClientState {
 		reviewModel: string | null;
 		maxRounds: number;
 		locked: boolean;
+		/** 目标模式 2.0：执行者模型（"provider/id"；null/缺省 = 跟随）。 */
+		execModel?: string | null;
 	};
 	/** Settings-panel state (system prompt mode/text + disabled skills/
 	 *  extensions) so toggles survive a reload. */
@@ -473,6 +481,16 @@ export interface ClientState {
 	locale?: string;
 }
 
+/** 跨平台（尤其是 Windows）路径归一化键：统一转绝对路径，并在 Windows 下转小写以消除大小写与正反斜杠差异。 */
+export function normalizePathKey(p: string): string {
+	try {
+		const resolved = resolve(p);
+		return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+	} catch {
+		return process.platform === "win32" ? p.toLowerCase() : p;
+	}
+}
+
 /**
  * Persists which workspace each browser client last used + which workspaces it
  * has opened, so a server restart / page reload restores the same project and
@@ -506,6 +524,26 @@ export class ClientStateStore {
 		} catch {
 			this.cache = {};
 		}
+		// 历史数据迁移：老版本将 removedProjects 仅记在各自临时 clientId 下，升级后新标签页无法继承。
+		// 启动/加载时自动将所有老 client 的墓碑合并到全局 __settings__，避免重启或新标签页后已删项目复活。
+		let migrated = false;
+		const globalState = (this.cache[ClientStateStore.GLOBAL_SETTINGS_KEY] ??= { projects: [] });
+		const globalSet = new Set((globalState.removedProjects ?? []).map(normalizePathKey));
+		for (const [id, cState] of Object.entries(this.cache)) {
+			if (id !== ClientStateStore.GLOBAL_SETTINGS_KEY && cState.removedProjects?.length) {
+				for (const p of cState.removedProjects) {
+					const key = normalizePathKey(p);
+					if (!globalSet.has(key)) {
+						globalSet.add(key);
+						(globalState.removedProjects ??= []).push(p);
+						migrated = true;
+					}
+				}
+			}
+		}
+		if (migrated) {
+			this.save();
+		}
 		return this.cache;
 	}
 
@@ -533,11 +571,15 @@ export class ClientStateStore {
 		const state = (all[clientId] ??= { projects: [] });
 		state.lastCwd = cwd;
 		const now = Date.now();
-		state.projects = [{ path: cwd, lastUsed: now }, ...state.projects.filter((p) => p.path !== cwd)].slice(0, 30);
+		const targetKey = normalizePathKey(cwd);
+		state.projects = [
+			{ path: cwd, lastUsed: now },
+			...state.projects.filter((p) => normalizePathKey(p.path) !== targetKey),
+		].slice(0, 30);
 		// Opening the workspace again clears its removal tombstone across all clients and global settings.
 		for (const cState of Object.values(all)) {
 			if (cState.removedProjects?.length) {
-				cState.removedProjects = cState.removedProjects.filter((p) => p !== cwd);
+				cState.removedProjects = cState.removedProjects.filter((p) => normalizePathKey(p) !== targetKey);
 			}
 		}
 		this.save();
@@ -551,21 +593,22 @@ export class ClientStateStore {
 	 *  explicitly opens that project again. */
 	removeProject(clientId: string, cwd: string): void {
 		const all = this.load();
+		const targetKey = normalizePathKey(cwd);
 		const state = (all[clientId] ??= { projects: [] });
-		state.projects = state.projects.filter((p) => p.path !== cwd);
-		if (state.lastCwd === cwd) delete state.lastCwd;
-		const removed = new Set(state.removedProjects ?? []);
-		removed.add(cwd);
-		state.removedProjects = [...removed];
+		state.projects = state.projects.filter((p) => normalizePathKey(p.path) !== targetKey);
+		if (state.lastCwd && normalizePathKey(state.lastCwd) === targetKey) delete state.lastCwd;
+		const removed = (state.removedProjects ?? []).filter((p) => normalizePathKey(p) !== targetKey);
+		removed.push(cwd);
+		state.removedProjects = removed;
 
 		const globalState = (all[ClientStateStore.GLOBAL_SETTINGS_KEY] ??= { projects: [] });
-		const globalRemoved = new Set(globalState.removedProjects ?? []);
-		globalRemoved.add(cwd);
-		globalState.removedProjects = [...globalRemoved];
+		const globalRemoved = (globalState.removedProjects ?? []).filter((p) => normalizePathKey(p) !== targetKey);
+		globalRemoved.push(cwd);
+		globalState.removedProjects = globalRemoved;
 
 		for (const [id, cState] of Object.entries(all)) {
 			if (id !== ClientStateStore.GLOBAL_SETTINGS_KEY && cState.projects) {
-				cState.projects = cState.projects.filter((p) => p.path !== cwd);
+				cState.projects = cState.projects.filter((p) => normalizePathKey(p.path) !== targetKey);
 			}
 		}
 		this.save();
@@ -579,7 +622,16 @@ export class ClientStateStore {
 		const globalRemoved = all[ClientStateStore.GLOBAL_SETTINGS_KEY]?.removedProjects ?? [];
 		if (globalRemoved.length === 0) return clientRemoved;
 		if (clientRemoved.length === 0) return globalRemoved;
-		return [...new Set([...clientRemoved, ...globalRemoved])];
+		const seen = new Set<string>();
+		const result: string[] = [];
+		for (const p of [...clientRemoved, ...globalRemoved]) {
+			const key = normalizePathKey(p);
+			if (!seen.has(key)) {
+				seen.add(key);
+				result.push(p);
+			}
+		}
+		return result;
 	}
 
 	/** Last-used goal/review prefs for a client, or undefined if never set. */
@@ -590,6 +642,7 @@ export class ClientStateStore {
 			reviewModel: s.goalPrefs.reviewModel ?? null,
 			maxRounds: s.goalPrefs.maxRounds ?? 0,
 			locked: s.goalPrefs.locked ?? true,
+			execModel: s.goalPrefs.execModel ?? null,
 		};
 	}
 
@@ -634,6 +687,7 @@ export class ClientStateStore {
 			reviewModel: prefs?.reviewModel ?? null,
 			maxRounds: prefs?.maxRounds ?? 0,
 			locked: prefs?.locked ?? true,
+			execModel: prefs?.execModel ?? null,
 		};
 		this.save();
 	}
@@ -693,8 +747,10 @@ export class ClientStateStore {
 					: (stored?.terminalToolsEnabled ?? false),
 			terminalBash: stored?.terminalBash ?? false,
 			terminalBashIdleMs: stored?.terminalBashIdleMs ?? 15_000,
+			terminalBashMaxForegroundMs: stored?.terminalBashMaxForegroundMs ?? 60_000,
 			toolWatchdogTimeoutMs: normalizeToolWatchdogTimeoutMs(stored?.toolWatchdogTimeoutMs),
 			readDirEnabled: stored?.readDirEnabled ?? true,
+			toolApprovalEnabled: stored?.toolApprovalEnabled ?? true,
 			editSoftEnabled:
 				stored?.disabledAgentTools !== undefined
 					? deriveLegacy(legacyToDisabled(stored)).editSoftEnabled
@@ -755,10 +811,12 @@ export class ClientStateStore {
 			terminalToolsEnabled: settings.terminalToolsEnabled ?? cur.terminalToolsEnabled ?? false,
 			terminalBash: settings.terminalBash ?? cur.terminalBash ?? false,
 			terminalBashIdleMs: settings.terminalBashIdleMs ?? cur.terminalBashIdleMs ?? 15_000,
+			terminalBashMaxForegroundMs: settings.terminalBashMaxForegroundMs ?? cur.terminalBashMaxForegroundMs ?? 60_000,
 			toolWatchdogTimeoutMs: normalizeToolWatchdogTimeoutMs(
 				settings.toolWatchdogTimeoutMs ?? cur.toolWatchdogTimeoutMs ?? DEFAULT_TOOL_WATCHDOG_TIMEOUT_MS,
 			),
 			readDirEnabled: settings.readDirEnabled ?? cur.readDirEnabled ?? true,
+			toolApprovalEnabled: settings.toolApprovalEnabled ?? cur.toolApprovalEnabled ?? true,
 			editSoftEnabled: settings.editSoftEnabled ?? cur.editSoftEnabled ?? false,
 			questionnaireEnabled: settings.questionnaireEnabled ?? cur.questionnaireEnabled ?? true,
 			goalModeEnabled: settings.goalModeEnabled ?? cur.goalModeEnabled ?? true,
@@ -770,8 +828,15 @@ export class ClientStateStore {
 			toolImagesEnabled: settings.toolImagesEnabled ?? cur.toolImagesEnabled ?? true,
 			skillsFullText: normalizeSkillList(settings.skillsFullText ?? cur.skillsFullText),
 			visionBridgeEnabled: settings.visionBridgeEnabled ?? cur.visionBridgeEnabled ?? true,
-			visionBridgeModel: settings.visionBridgeModel ?? cur.visionBridgeModel ?? null,
-			subagentDefaultModel: settings.subagentDefaultModel ?? cur.subagentDefaultModel ?? null,
+			// 按键存在性合并：null 是合法值（清除语义），`null ?? cur` 会把旧值
+			// 复活到磁盘（设置面板清空后重启又回来）。settings-service 持久化
+			// 时传全量对象，键总在；其他调用方传 partial，键缺 = 保持旧值。
+			visionBridgeModel:
+				"visionBridgeModel" in settings ? (settings.visionBridgeModel ?? null) : (cur.visionBridgeModel ?? null),
+			subagentDefaultModel:
+				"subagentDefaultModel" in settings
+					? (settings.subagentDefaultModel ?? null)
+					: (cur.subagentDefaultModel ?? null),
 			retryMaxAttempts: normalizeRetryMaxAttempts(
 				settings.retryMaxAttempts ?? cur.retryMaxAttempts ?? DEFAULT_RETRY_MAX_ATTEMPTS,
 			),
