@@ -8446,13 +8446,6 @@ export class ClientSession {
 			this.flushSnapshot();
 			return;
 		}
-		// 置换守卫：从这一刻起本对话「有活干」——前置的附件构建与工作区影子快照
-		// 都是异步的，在它们完成前对话既不 streaming 也没有新消息落盘，
-		// displaceActive() 会把它误判成空闲对话并销毁 runtime，投递中的消息就
-		// 此静默丢失（issue：新建对话后旧对话的首条消息凭空消失）。放在委派 /
-		// 审查顺延两个早退闸门之后：那两条路径不进投递流程，提前 return 不会
-		// 经过下面的 finally，若在这里置位将永远卡住（对话再也移不出）。
-		conv.promptInFlight = true;
 		// 输入框内容被消费（发送/斜杠执行）→ 清掉该会话存过的草稿（best-effort）。
 		// 快捷短语发送（不碰输入框）同样清：客户端发送成功后会把当前草稿重存回来。
 		// clear() 同时记录 clear 时间戳水位：清掉之后才 landing 的旧 draft_update
@@ -8760,6 +8753,12 @@ export class ClientSession {
 				// 立刻要有它（此刻还在流式输出，不能等 agent_end 的防抖刷新）。
 				this.emitConversations();
 			}
+			// 置换守卫：从这一刻起进入异步前置（附件构建 + 影子快照）——在它们完成前
+			// 对话既不 streaming 也没有新消息落盘，displaceActive() 会把它误判成
+			// 空闲对话并销毁 runtime，导致投递中的消息被静默丢弃。放在所有同步校验 /
+			// 原生斜杠命令拦截之后：原生命令（/new, /cwd 等）不进投递流程且可能
+			// 立即切换会话，若提前置位会被 displaceActive 误判为有消息投递而报错通知。
+			conv.promptInFlight = true;
 			// Attach files as independent nextTurn context messages (asides) so the
 			// user message stays clean; they render as separate attachment cards.
 			const asides = await buildAttachmentMessages(
@@ -9738,7 +9737,7 @@ export class ClientSession {
 			});
 		if (retained) {
 			conv.listed = true;
-			if (conv.promptInFlight) {
+			if (conv.promptInFlight && !conv.session.isStreaming) {
 				this.emit({
 					type: "notice",
 					level: "info",
@@ -10513,6 +10512,7 @@ export class ClientSession {
 			// Dismiss 口径：只看“用过”的用户终端（AI bash 不钉住，见上）。
 			openTerminals: conv.terminals.countUserBlockingLive(),
 			listed: false,
+			promptInFlight: Boolean(conv.promptInFlight),
 			promptedSinceActive: false,
 			hasActiveSubagentRun: () => hasActiveSubagentRun({ sessionId: conv.session.sessionFile }),
 			hasPendingWake: () => hasPendingWaitSubscription({ sessionId: conv.session.sessionFile }),
