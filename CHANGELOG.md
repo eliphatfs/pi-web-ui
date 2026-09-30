@@ -12,6 +12,8 @@
 
 ### Added
 
+- **对话可「钉住」常驻运行列表** —— 左栏「运行的对话」右键新增「钉住」：被钉的对话切到别的对话也不释放运行时（空闲、无存活终端、无后台任务时同样保留，优先级高于「打开未继续即移出」等所有自动规则），直到显式移出或强行关闭；取消钉住后立即恢复原有释放策略。进程内有效、不落盘。回归：`tests/unit/conv-pin.test.ts`、`tests/unit/wait-subscription-scan.test.ts`、`tests/conv-pin-browser-test.mjs`（真浏览器右键 → 钉住/取消钉住 → 切走仍留存 / 对照移出）。
+
 - **上下文压缩后支持展开/查看被折叠的历史对话（#398）** —— 严格解耦「UI 展示流」与「LLM 推理视窗」：触发压缩（Compaction）后，在 `CompactionCard` 底部提供「展开查看被折叠的历史」操作栏，按需（On-demand）从会话 DAG 祖先链中还原被该节点折叠的原始历史消息（含提问、回答与工具输出），并以只读流视窗呈现，不占用后续推理 Token，解决长对话截断后无法回溯方案与日志的痛点。回归：`tests/unit/compacted-history.test.ts`。
 
 - **粘贴任意文件直接附加** —— 在输入框粘贴从文件管理器复制的文件（文本、PDF、压缩包等）会像拖拽一样变成待发附件，不再只能贴图片：粘贴与拖拽现在共用同一条分流逻辑（图片走视觉管线并保留 text-only 模型的拦截，其余走 fileData 上传，20MB 上限同口径），纯文本粘贴完全不受影响。回归：`tests/unit/clipboard-files.test.ts` + `tests/file-paste-browser-test.mjs`。
@@ -26,6 +28,7 @@
 - **语音浮层计时器泄漏** —— 切换识别方式时上一个浮层的计时器不再残留（此前每切一次泄一个 500ms 定时器）。
 
 <!-- auto-i18n:start -->
+
 ### i18n
 
 - 前端新增 key（52）：`elsewherePseudoBadge`、`elsewherePseudoTip`、`planImplementBtn`、`planImplementTip`、`planImplementRequest`、`viewCompactedHistory`、`hideCompactedHistory`、`compactedHistoryLoading`、`compactedHistoryEmpty`、`compactedHistoryBadge`、`compactedHistoryTurns`、`planMode`、`planActionBtn`、`planActionTip`、`planModeTip`、`planModeTipOn`、`goalBarExecModel`、`goalBarExecModelTip`、`goalBarOpenExec`、`goalBarOpenExecTip`、`goalBarStaleBackend`、`goalBarStop`、`goalBarExecuting`、`goalHistory`、`delegateMode`、`delegateModeDesc`、`delegateModeOffHint`、`delegateModeBadge`、`delegateModeBadgeTip`、`delegateModeOpenTip`、`toolCorePowershellDesc`、`toolCoreLsDesc`、`toolCoreGrepDesc`、`toolCoreFindDesc`、`pluginToolsDisabledByPlugin`、`pluginDisabledInPlugins`、`toolDescSubagent`、`planModePromptSettingsTitle`、`planModePromptSettingsDesc`、`planModePromptMode`、`planModePromptPlaceholder`、`planModePromptSettingsHint`、`preset.standard`、`preset.minimal`、`preset.code`、`preset.reader`、`preset.ask`、`preset.standardDesc`、`preset.minimalDesc`、`preset.codeDesc`、`preset.readerDesc`、`preset.askDesc`
@@ -34,6 +37,7 @@
 - 服务端新增 key（18）：`agent.role.stop`、`goal.role.blocked`、`goal.role.conv_title`、`goal.role.exec`、`goal.role.card.start`、`goal.role.card.result`、`goal.role.review`、`goal.role.review.retry`、`subagents.action.missing`、`subagents.spawn.missing.prompt`、`subagents.get.missing.runId`、`subagents.steer.missing.runId`、`subagents.steer.missing.message`、`subagents.stop.missing.runId`、`subagents.wait.item.missing`、`subagents.handoff.missing.toRunId`、`subagents.handoff.missing.payload`、`subagents.action.unknown`
 - 服务端文案变更（10）：`delegate.validate.agent`、`delegate.validate.short`、`delegate.started`、`subagents.spawn.template.unavailable`、`subagents.spawn.started`、`subagents.steer.not.found`、`subagents.stop.not.found`、`subagents.wait.empty`、`subagents.templates.list`、`subagents.handoff.not.found`
 - 服务端删除 key（9）：`goal.set.kick`、`goal.wizard.kick`、`goal.review.incomplete`、`goal.autonomous.pass`、`goal.review.blocked`、`goal.autonomous.continue`、`goal.review.error`、`goal.review.blocked_msg`、`goal.review.revise`
+
 <!-- auto-i18n:end -->
 
 ## [0.96.1] — 2026-09-26
