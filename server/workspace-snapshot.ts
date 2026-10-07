@@ -5,9 +5,11 @@
  *
  * 每次用户发起新任务或运行关键操作前，为当前工作区记录轻量快照引用（Git commit SHA）。
  * 机制：
- * - 利用独立的临时 GIT_INDEX_FILE，通过 `git add -A` + `git write-tree` + `git commit-tree` 生成独立 commit；
+ * - 利用独立的临时 GIT_INDEX_FILE，通过 `git add -A -- .` + `git write-tree` + `git commit-tree` 生成独立 commit；
+ * - 快照只覆盖对话 cwd 的**子树**（而非整个工作区），commit-tree 的顶层因此只有该子目录一个条目；
  * - 绝不改变用户现有的 HEAD、branch 指针、工作区文件或 .git/index；
- * - 回滚时若启用 restoreWorkspace，通过 `git checkout <snapshotRef> -- .` 与 `git clean -fd` 还原物理文件。
+ * - 回滚时若启用 restoreWorkspace，通过 `git checkout <snapshotRef> -- <prefix>` 与 `git clean -fd -- <prefix>`
+ *   只还原/清理 cwd 子树，绝不触碰同仓库的兄弟目录。
  */
 
 import { execFile } from "node:child_process";
@@ -53,8 +55,9 @@ export async function createWorkspaceSnapshot(cwd: string): Promise<string | nul
 	const env = { GIT_INDEX_FILE: tempIndex };
 
 	try {
-		// 1. 将当前工作区所有改动（含未跟踪与新增）记录到临时 index
-		await runGit(cwd, ["add", "-A"], env);
+		// 1. 将 cwd 子树（而非整个工作区）的当前改动（含未跟踪与新增）记录到临时 index；
+		//    暂存路径相对仓库根，write-tree 顶层因此只有该子目录一个条目
+		await runGit(cwd, ["add", "-A", "--", "."], env);
 
 		// 2. 写入 tree 对象
 		const tree = await runGit(cwd, ["write-tree"], env);
@@ -92,11 +95,14 @@ export async function createWorkspaceSnapshot(cwd: string): Promise<string | nul
 }
 
 /**
- * 将工作区物理文件还原到指定的快照状态。
+ * 将工作区物理文件还原到指定的快照状态，作用范围严格限定在 cwd 子树内。
  *
- * 执行步骤：
- * 1. `git read-tree -u --reset <snapshotRef>` 将 index 与工作区重置为快照树，并删除快照之后新增的文件；
- * 2. `git clean -fd` 清理快照之后新增的未跟踪文件与空目录。
+ * 执行步骤（pathspec 全部以 `:(top)` 锚定到仓库根的 cwd 前缀，仓库根时退化为 `.`）：
+ * 1. `git rm -r --cached -- <pathspec>` 把 cwd 子树移出 index（工作区文件不动），使快照中
+ *    不存在的文件退回未跟踪状态——这一步让 checkout 之外的「快照后新增且已 add」的文件也能被回滚；
+ * 2. `git checkout <snapshotRef> -- <pathspec>` 把快照内容写回 index 与工作区（恢复被修改/删除的跟踪文件）；
+ * 3. `git clean -fd -- <pathspec>` 清理快照之后新增的未跟踪文件与空目录。
+ * 同仓库的兄弟目录在以上任何一步都不受影响。
  */
 export async function restoreWorkspaceSnapshot(
 	cwd: string,
@@ -111,11 +117,21 @@ export async function restoreWorkspaceSnapshot(
 		// 验证 snapshotRef 合法性
 		await runGit(cwd, ["rev-parse", "--verify", snapshotRef]);
 
-		// 1. 将 index 和工作区彻底重置到快照树状态（自动清除快照中不存在的文件）
-		await runGit(cwd, ["read-tree", "-u", "--reset", snapshotRef]);
+		// cwd 相对仓库根的前缀（子目录形如 `proj/`，仓库根为空串）。
+		const prefix = await runGit(cwd, ["rev-parse", "--show-prefix"]);
 
-		// 2. 清理新产生的未跟踪文件与目录
-		await runGit(cwd, ["clean", "-fd"]);
+		// 锚定到仓库根的 pathspec：子目录用 `:(top)proj/`，仓库根（前缀为空）直接用 `.`，
+		// 与旧的整仓还原行为逐字等价。
+		const pathspec = prefix ? `:(top)${prefix}` : ".";
+
+		// 1. 把 cwd 子树移出 index（不删除工作区文件），快照里不存在的文件由此退回未跟踪状态
+		await runGit(cwd, ["rm", "-r", "--cached", "--quiet", "--ignore-unmatch", "--", pathspec]);
+
+		// 2. 从快照树把 cwd 子树写回 index 与工作区（恢复被修改与被删除的跟踪文件）
+		await runGit(cwd, ["checkout", snapshotRef, "--", pathspec]);
+
+		// 3. 清理快照之后新增的未跟踪文件与空目录（含第 1 步退回未跟踪的那些）
+		await runGit(cwd, ["clean", "-fd", "--", pathspec]);
 
 		return { success: true };
 	} catch (err) {
