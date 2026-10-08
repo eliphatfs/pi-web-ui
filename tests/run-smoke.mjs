@@ -14,14 +14,20 @@
  *       node tests/run-smoke.mjs --core          # PR 快检子集（CORE，见下）
  *       node tests/run-smoke.mjs --jobs=4         # 并行（默认 4 worker；--jobs=1 串行）
  *       node tests/run-smoke.mjs --retry-once     # 首轮失败重跑一次（标 FLAKY）
+ *       node tests/run-smoke.mjs --no-build       # 不构建（dist/ 已就绪，如 CI 刚跑过 npm run build）
+ *
+ * dist/ 由本跑器在开跑前构建**一次**（串行，见 tests/lib/ensure-build.mjs）：用例自己构建会在
+ * 并行下互相踩（一个在重写 dist/、另一个在 spawn dist/server/index.js → 假红）。
  *
  * 分层策略（CI 提速：PR 只跑 CORE，push main + nightly 跑全量）：
  * - CORE = 协议/快照/安全/审批/插件接线/并发代表，~20 个，2~4 分钟；
  * - 全量 = CORE + 慢/重插件（ssh 现场 npm 装、vscode 大插件等）+ 各家回归，~9 分钟；
  * - 新测试默认进 ALL；只有「零 token、自包含、跑得快（<20s）、稳」才进 CORE。
  */
-import { spawn } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { PREBUILT_ENV } from "./lib/ensure-build.mjs";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -84,6 +90,10 @@ const ALL = [
 	// 笔记插件（notes）：清单/HTTP 通道/长轮询推送/持久化（零 token，浏览器 E2E 另见 notes-ui-test）。
 	"notes-test",
 	"plugin-bgtask-test",
+	// 后台任务「自动清理」的协议面（阈值落库/归一化、钉住、立即清理反馈）。
+	"bg-cleanup-test",
+	// pm2 进程管家：manifest 被宿主接受 + topbar 占用 + 真激活 + 五个路由（零 token）。
+	"pm2-manager-plugin-test",
 	"plugin-command-test",
 	"plugin-cwd-test",
 	"plugin-http-test",
@@ -124,8 +134,12 @@ const ALL = [
 	"orphan-adopt-test",
 	// 手动过户：右键「另一处」行把对话（含等答复问卷）搬到本页，问卷可直接回答。
 	"takeover-test",
+	// 过户夭折回滚（#556）：源侧已摘、目标侧接入失败时把对话原样搬回，绝不留幽灵会话。
+	"takeover-rollback-test",
 	// 已结束对话的过户：run 跑完后 elsewhere 仍保留空闲行可过户；新页面不自动恢复别处持有的会话。
 	"idle-takeover-test",
+	// 离线持有方：手机 run 途中关页面 → run 跑完 → 另一台设备仍能看到「另一处（离线）」行并过户。
+	"offline-takeover-test",
 	// 跨页作答：点 elsewhere 行的 `?` 把问卷拉到本页回答，不搬迁对话。
 	"remote-answer-test",
 	// elsewhere 生命周期（#291）：断连残骸不入列表、删定时任务回收伪客户端。
@@ -244,6 +258,33 @@ for (const name of targets) {
 	}
 	queue.push(name);
 }
+
+// dist/ 只在开跑前构建**一次**（串行）。用例侧的构建已改为 tests/lib/ensure-build.mjs：
+// 见到 PREBUILT_ENV 就直接用现成产物。为什么必须挪到这里：并行下用例各自 `npm run build`
+// 时，一个进程正在重写 dist/、另一个进程同时 spawn dist/server/index.js，会出现与被测
+// 逻辑无关的假红（“测试插件没被激活”之类），而且整棵 vite+tsc+vendor 被重复构建 N 遍。
+const repoRoot = dirname(here);
+const distEntryPath = join(repoRoot, "dist", "server", "index.js");
+const wantNoBuild = rawArgs.includes("--no-build");
+if (wantNoBuild) {
+	if (!existsSync(distEntryPath)) {
+		console.error(`✗ --no-build 但产物不存在：${distEntryPath}（先跑 npm run build）`);
+		process.exit(1);
+	}
+	console.log("ℹ 跳过构建（--no-build）：直接用现有 dist/");
+} else {
+	process.stdout.write("ℹ 构建 dist/（npm run build，整套只构建这一次）…");
+	const t0 = Date.now();
+	try {
+		execSync("npm run build", { cwd: repoRoot, stdio: "ignore" });
+	} catch {
+		console.error("\n✗ npm run build 失败 —— 先手动跑一次看完整输出；已终止冒烟（免得拿半份产物跑出假红）");
+		process.exit(1);
+	}
+	console.log(` 完成（${((Date.now() - t0) / 1000).toFixed(1)}s）`);
+}
+// 子进程据此跳过用例内的构建（单跑某个 *-test.mjs 时没有这个标记，仍会自己构建）。
+process.env[PREBUILT_ENV] = "1";
 
 if (jobs <= 1) {
 	for (const name of queue) {
