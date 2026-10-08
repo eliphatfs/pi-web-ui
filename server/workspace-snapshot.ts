@@ -97,11 +97,13 @@ export async function createWorkspaceSnapshot(cwd: string): Promise<string | nul
 /**
  * 将工作区物理文件还原到指定的快照状态，作用范围严格限定在 cwd 子树内。
  *
- * 执行步骤（pathspec 全部以 `:(top)` 锚定到仓库根的 cwd 前缀，仓库根时退化为 `.`）：
- * 1. `git rm -r --cached -- <pathspec>` 把 cwd 子树移出 index（工作区文件不动），使快照中
- *    不存在的文件退回未跟踪状态——这一步让 checkout 之外的「快照后新增且已 add」的文件也能被回滚；
- * 2. `git checkout <snapshotRef> -- <pathspec>` 把快照内容写回 index 与工作区（恢复被修改/删除的跟踪文件）；
- * 3. `git clean -fd -- <pathspec>` 清理快照之后新增的未跟踪文件与空目录。
+ * 执行步骤：
+ * - 仓库根 cwd：使用原子 `git read-tree -u --reset` + `git clean -fd` 整仓还原（天然支持空仓库快照）；
+ * - 子目录 cwd（pathspec 以 `:(top)` 锚定到仓库根的 cwd 前缀）：
+ *   1. `git rm -r --cached -- <pathspec>` 把 cwd 子树移出 index（工作区文件不动），使快照中
+ *      不存在的文件退回未跟踪状态——这一步让 checkout 之外的「快照后新增且已 add」的文件也能被回滚；
+ *   2. `git checkout <snapshotRef> -- <pathspec>` 把快照内容写回 index 与工作区（恢复被修改/删除的跟踪文件，快照无该子树文件时容错跳过）；
+ *   3. `git clean -fd -- <pathspec>` 清理快照之后新增的未跟踪文件与空目录。
  * 同仓库的兄弟目录在以上任何一步都不受影响。
  */
 export async function restoreWorkspaceSnapshot(
@@ -120,15 +122,31 @@ export async function restoreWorkspaceSnapshot(
 		// cwd 相对仓库根的前缀（子目录形如 `proj/`，仓库根为空串）。
 		const prefix = await runGit(cwd, ["rev-parse", "--show-prefix"]);
 
-		// 锚定到仓库根的 pathspec：子目录用 `:(top)proj/`，仓库根（前缀为空）直接用 `.`，
-		// 与旧的整仓还原行为逐字等价。
-		const pathspec = prefix ? `:(top)${prefix}` : ".";
+		if (!prefix) {
+			// 仓库根 cwd：整仓还原，使用原子 read-tree --reset，旧实现经过长期验证且天然支持空仓库快照
+			await runGit(cwd, ["read-tree", "-u", "--reset", snapshotRef]);
+			await runGit(cwd, ["clean", "-fd"]);
+			return { success: true };
+		}
+
+		// 子目录 cwd：作用域收敛到该子树，不误伤同仓兄弟目录与仓库根
+		const pathspec = `:(top)${prefix}`;
 
 		// 1. 把 cwd 子树移出 index（不删除工作区文件），快照里不存在的文件由此退回未跟踪状态
 		await runGit(cwd, ["rm", "-r", "--cached", "--quiet", "--ignore-unmatch", "--", pathspec]);
 
 		// 2. 从快照树把 cwd 子树写回 index 与工作区（恢复被修改与被删除的跟踪文件）
-		await runGit(cwd, ["checkout", snapshotRef, "--", pathspec]);
+		//    注：若快照时刻该子树为空（快照树内无匹配文件），checkout 会报
+		//    "did not match any file(s) known to git"；此时快照树内本无文件，捕获忽略即可，
+		//    第 3 步 clean 会清理掉新增文件完成空状态还原。
+		try {
+			await runGit(cwd, ["checkout", snapshotRef, "--", pathspec]);
+		} catch (checkoutErr) {
+			const errMsg = String(checkoutErr);
+			if (!errMsg.includes("did not match any file(s) known to git")) {
+				throw checkoutErr;
+			}
+		}
 
 		// 3. 清理快照之后新增的未跟踪文件与空目录（含第 1 步退回未跟踪的那些）
 		await runGit(cwd, ["clean", "-fd", "--", pathspec]);

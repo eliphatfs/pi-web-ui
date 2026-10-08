@@ -200,4 +200,51 @@ describe("工作区版本影子快照与双向联动回滚 (Dual-State Rollback)
 			"sibling v2 TOUCHED\n",
 		);
 	}, 20000);
+
+	it("空子目录快照在有新增文件后能够安全还原为空", async () => {
+		execSync("git init", { cwd: testDir, stdio: "ignore" });
+		execSync("git config user.name test && git config user.email test@test.com", {
+			cwd: testDir,
+			stdio: "ignore",
+		});
+
+		writeFileSync(join(testDir, "root.txt"), "root v1\n");
+		mkdirSync(join(testDir, "empty-sub"));
+		execSync("git add root.txt && git commit -m initial", { cwd: testDir, stdio: "ignore" });
+
+		const subDir = join(testDir, "empty-sub");
+		const snapshot = await createWorkspaceSnapshot(subDir);
+		expect(snapshot).toBeTruthy();
+
+		// AI 新增了文件
+		writeFileSync(join(subDir, "created.txt"), "created by ai\n");
+		execSync("git add .", { cwd: subDir, stdio: "ignore" });
+
+		// 还原
+		const res = await restoreWorkspaceSnapshot(subDir, snapshot!);
+		expect(res.error).toBeUndefined();
+		expect(res.success).toBe(true);
+		expect(existsSync(join(subDir, "created.txt"))).toBe(false);
+	}, 20000);
+
+	it("空仓库根目录快照在有新增文件后能够安全还原为空", async () => {
+		execSync("git init", { cwd: testDir, stdio: "ignore" });
+		execSync("git config user.name test && git config user.email test@test.com", {
+			cwd: testDir,
+			stdio: "ignore",
+		});
+
+		const snapshot = await createWorkspaceSnapshot(testDir);
+		expect(snapshot).toBeTruthy();
+
+		// AI 新增了文件
+		writeFileSync(join(testDir, "created.txt"), "created by ai\n");
+		execSync("git add .", { cwd: testDir, stdio: "ignore" });
+
+		// 还原
+		const res = await restoreWorkspaceSnapshot(testDir, snapshot!);
+		expect(res.error).toBeUndefined();
+		expect(res.success).toBe(true);
+		expect(existsSync(join(testDir, "created.txt"))).toBe(false);
+	}, 20000);
 });

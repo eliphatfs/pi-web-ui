@@ -21,9 +21,10 @@
 - **定时任务三件套合并为单 `schedule` 工具** —— `schedule_task` / `schedule_list` / `schedule_cancel` 三个独立工具合并为一个 action 式 `schedule`：`action=create` 建任务、`action=list` 查看、`action=cancel` 按 id 取消。工具条目从 3 个减为 1 个（设置页「工具」照常循环渲染；旧版本关掉过任意一个 `schedule_*` 的用户会保持关闭，禁用名单自动迁移）。计划 / 审查者 / 目标审查三道只读闸门的派发名单同步为 `schedule`（保守起见整工具拒，调度面在这三道闸门都不需要）。
 - **webmail 插件六个 AI 工具合并为单 `mail` 工具** —— `mail_list` / `mail_read` / `mail_search` / `mail_send` / `mail_manage` / `mail_folders` 合并为一个 action 式 `mail`（`action=list|read|search|send|manage|folders`），邮件条数、正文、发信与批量标记/删除的返回文本与参数语义不变；`mail_send` 原有的「发送前先与用户确认一次」守则原样保留。工具条目从 6 个减为 1 个；设置页「注册的 AI 工具」开关同步为单行。
 - **工具提示词全量收敛（少 18.5% 字符）** —— 模型同一轮里能同时看到三处工具信息（tool schema 的 `description`、`Available tools` 列表里的 `promptSnippet`、`Guidelines` 段里的 `promptGuidelines`），过去大量内容是同一句话的三份复述。现在职责严格分开：`description` 只写「做什么 + 副作用/边界」（≤600c）、`promptSnippet` 只写触发条件（≤80c、不再重复工具名前缀、不再复述描述）、`promptGuidelines` 只管「何时用/顺序/禁止/跨工具路由」；同一个参数块被多个工具复用的（SSH 凭据、数据库连接/库参数、桌面坐标）抽成共享常量。服务端内置工具少 6.1k 字符（-24.7%，其中 1.1k 是 `terminals.ts` 里**永不发送**的终端版 bash 文案死副本），插件侧少 3.8k（-13.5%）。bash 的提示词与参数 schema 统一到新增的 `server/tool-prompts.ts`（原生/终端/分流三路径单源）。守卫升级：`tests/unit/tool-prompt-hygiene.test.ts` 新增长度上限、snippet 工具名前缀、snippet/guideline 复述检测与同文件同义重复检测。
-- **工作区影子快照作用域收敛到对话 cwd 子树（Dual-State Rollback）** —— 之前 `createWorkspaceSnapshot` / `restoreWorkspaceSnapshot` 按整仓处理（`git add -A` + `git read-tree -u --reset` + 裸 `git clean -fd`），对话 cwd 在子目录时回滚会误伤同仓库的兄弟目录与仓库根文件。现在快照只暂存 cwd 子树（`git add -A -- .`，commit-tree 顶层只有该子目录一个条目），还原改为「`git rm -r --cached` + `git checkout <ref> -- <前缀>` + `git clean -fd -- <前缀>`」，前缀取自 `git rev-parse --show-prefix` 并以 `:(top)` 锚定到仓库根（仓库根 cwd 时退化为 `.`，与旧实现逐字等价）；兄弟目录在还原后保持被篡改的状态不变。回归：`tests/unit/workspace-snapshot.test.ts`（新增子目录 / 嵌套子目录作用域用例）。
+- **工作区影子快照作用域收敛到对话 cwd 子树（Dual-State Rollback）** —— 之前 `createWorkspaceSnapshot` / `restoreWorkspaceSnapshot` 按整仓处理（`git add -A` + `git read-tree -u --reset` + 裸 `git clean -fd`），对话 cwd 在子目录时回滚会误伤同仓库的兄弟目录与仓库根文件。现在快照只暂存 cwd 子树（`git add -A -- .`，commit-tree 顶层只有该子目录一个条目），还原区分根目录与子目录：根目录保持原有的原子 `read-tree` + `clean`；子目录采用「`git rm -r --cached` + `git checkout <ref> -- <前缀>` + `git clean -fd -- <前缀>`」，前缀取自 `git rev-parse --show-prefix` 并以 `:(top)` 锚定到仓库根，快照中无对应子树文件时容错跳过检出；兄弟目录与仓库根在还原后保持被篡改的状态不变。回归：`tests/unit/workspace-snapshot.test.ts`（覆盖子目录、嵌套子目录、空子目录与空根目录作用域用例）。
 
 <!-- auto-i18n:start -->
+
 ### i18n
 
 - 前端新增 key（12）：`toolLazyLoading`、`toolLazyLoadingDesc`、`toolPromptEdit`、`toolPromptEdited`、`toolPromptHint`、`toolPromptDescription`、`toolPromptSnippet`、`toolPromptGuidelines`、`toolPromptDefault`、`toolPromptReset`、`toolPromptSave`、`toolPromptUnavailable`
@@ -31,6 +32,7 @@
 - 前端英文变更（1）：`scheduleTaskEnabledDesc`
 - 服务端新增 key（13）：`loadtools.notready`、`loadtools.unknown`、`loadtools.always`、`loadtools.already`、`loadtools.disabled`、`loadtools.preset`、`loadtools.names.empty`、`loadtools.loaded`、`loadtools.rejected`、`loadtools.none`、`prompt.tools.lazy`、`sched.action.missing`、`sched.action.unknown`
 - 服务端文案变更（3）：`sched.list.empty`、`sched.cancel.empty.id`、`sched.cancel.not.found`
+
 <!-- auto-i18n:end -->
 
 ## [0.99.0] — 2026-10-03
